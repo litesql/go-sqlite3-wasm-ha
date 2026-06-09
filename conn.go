@@ -1,0 +1,900 @@
+package sqliteha
+
+import (
+	"context"
+	"crypto/tls"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/litesql/go-ha"
+	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
+	haconnect "github.com/litesql/go-ha/connect"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+)
+
+var ErrTimedOut = errors.New("Timed out")
+
+var queryRouterHintMatcher = regexp.MustCompile(`(?i)/\*\+\s*db=(.*?)\s*\*/`).FindStringSubmatch
+
+type contextKey int
+
+const ignoreQueryRouterKey contextKey = iota
+
+type ProxiedQuerierExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+type Conn struct {
+	SQLiteConn
+	disableDDLSync bool
+	enableRedirect bool
+
+	currentRedirectTarget string
+	grpcClientConn        *grpc.ClientConn
+
+	leader        ha.LeaderProvider
+	replicationID string
+	reqCh         chan *sqlv1.QueryRequest
+	resCh         chan *sqlv1.QueryResponse
+
+	txseq uint64
+
+	activeTransaction bool
+
+	txseqTracker ha.TxSeqTracker
+	timeout      time.Duration
+	token        string
+	insecure     bool
+
+	invalid bool
+
+	proxiedDB                 *sql.DB
+	proxiedTxExecer           ProxiedQuerierExecer
+	proxiedPositionProvider   ha.ProxiedPositionProvider
+	currentWritePosition      uint64
+	latestTransactionPosition uint64
+
+	queryRouter *regexp.Regexp
+}
+
+func (c *Conn) Deserialize(b []byte, _ string) error {
+	return fmt.Errorf("Not implemented")
+}
+
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	var (
+		modifies bool
+		stmts    []*ha.Statement
+	)
+	if c.redirectToGrpc(true) || !c.disableDDLSync || c.proxiedDB != nil {
+		var err error
+		stmts, err = ha.Parse(ctx, query)
+		if err != nil {
+			if !ha.LocalDB(ctx) {
+				if c.redirectToGrpc(true) {
+					slog.Debug("invalid sqlite syntax, redirecting to leader", "error", err)
+					res, err2 := c.redirectExecToGrpc(ctx, query, args)
+					if err2 != nil {
+						return nil, errors.Join(err, err2)
+					}
+					return res, nil
+				} else if c.proxiedDB != nil {
+					slog.Debug("invalid sqlite syntax, redirecting to proxied db", "error", err)
+					res, err2 := c.proxiedQuerierExecer().ExecContext(ctx, query, toSqlValues(args)...)
+					if err2 != nil {
+						return nil, errors.Join(err, err2)
+					} else {
+						c.updateProxiedPosition(ctx)
+					}
+					return res, nil
+				}
+			}
+
+			return nil, err
+		}
+
+		for _, stmt := range stmts {
+			if stmt.ModifiesDatabase() {
+				modifies = true
+				break
+			}
+		}
+	}
+	if c.redirectToGrpc(modifies) {
+		return c.redirectExecToGrpc(ctx, query, args)
+	}
+
+	var ddlCommands strings.Builder
+	if !c.disableDDLSync {
+		for _, stmt := range stmts {
+			if stmt.DDL() {
+				ddlCommands.WriteString(stmt.SourceWithIfExists())
+			}
+		}
+	}
+	if ddlCommands.Len() > 0 {
+		clearTableSchemaCache(c.replicationID)
+		if err := addSQLChange(c.SQLiteConn, ddlCommands.String(), nil); err != nil {
+			return nil, err
+		}
+	}
+	var (
+		res driver.Result
+		err error
+	)
+	if c.proxiedDB != nil && modifies && !ha.LocalDB(ctx) {
+		res, err = c.proxiedQuerierExecer().ExecContext(ctx, query, toSqlValues(args)...)
+		if err == nil {
+			c.updateProxiedPosition(ctx)
+		}
+	} else {
+		res, err = c.SQLiteConn.ExecContext(ctx, query, args)
+	}
+	if err != nil && ddlCommands.Len() > 0 {
+		removeLastChange(c.SQLiteConn)
+	}
+	return res, err
+}
+
+func (c *Conn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	return c.ExecContext(context.Background(), query, toNamedValues(args))
+}
+
+func (c *Conn) IsValid() bool {
+	return !c.invalid
+}
+
+func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	slog.Info("QueryContext", "query", query, "args", args)
+	if ha.LocalDB(ctx) {
+		return c.queryContext(ctx, query, args)
+	}
+
+	var (
+		modifies bool
+		stmts    []*ha.Statement
+	)
+	if c.redirectToGrpc(true) || !c.disableDDLSync || c.proxiedDB != nil {
+		var err error
+		stmts, err = ha.Parse(ctx, query)
+		if err != nil {
+			if c.redirectToGrpc(true) {
+				slog.Debug("invalid sqlite syntax, redirecting to leader", "error", err)
+				res, err2 := c.redirectQuery(ctx, query, args)
+				if err2 != nil {
+					return nil, errors.Join(err, err2)
+				}
+				return res, nil
+			} else if c.proxiedDB != nil {
+				slog.Debug("invalid sqlite syntax, redirecting to proxied db", "error", err)
+				res, err2 := c.redirectQueryToProxied(ctx, query, args)
+				if err2 != nil {
+					return nil, errors.Join(err, err2)
+				}
+				return res, nil
+			}
+			return nil, err
+		}
+
+		for _, stmt := range stmts {
+			if stmt.ModifiesDatabase() {
+				modifies = true
+				break
+			}
+		}
+	}
+	if c.redirectToGrpc(modifies) {
+		return c.redirectQuery(ctx, query, args)
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	ctxTimeout, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+LOOP:
+	for {
+		if c.txseqTracker.LatestSeq() >= c.txseq {
+			break LOOP
+		}
+
+		select {
+		case <-ctxTimeout.Done():
+			return c.redirectQuery(ctx, query, args)
+		case <-ticker.C:
+		}
+	}
+	if len(stmts) == 1 && !c.ignoreQueryRouter(ctx) {
+		qr := c.queryRouter
+		queryRouterExp := queryRouterHintMatcher(query)
+		if len(queryRouterExp) == 2 {
+			if exp, err := regexp.Compile(strings.TrimSpace(queryRouterExp[1])); err == nil {
+				qr = exp
+			}
+		}
+		if qr != nil && qr.String() != "self" {
+			return ha.CrossShardQuery(context.WithValue(ctx, ignoreQueryRouterKey, true), stmts[0], args, qr, func(c *sql.Conn) (driver.QueryerContext, error) {
+				return sqliteConnQuerierContext(c)
+			})
+		}
+	}
+	if c.proxiedDB != nil && (modifies || c.activeTransaction) {
+		rows, err := c.redirectQueryToProxied(ctx, query, args)
+		if err != nil {
+			return nil, err
+		}
+		if modifies {
+			c.updateProxiedPosition(ctx)
+		}
+		return rows, err
+	}
+
+	if c.currentWritePosition == 0 || c.proxiedDB == nil {
+		stmt, err := c.SQLiteConn.PrepareContext(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		return stmt.(driver.StmtQueryContext).QueryContext(ctx, args)
+	}
+
+	tickerRYW := time.NewTicker(time.Millisecond)
+	defer tickerRYW.Stop()
+
+	ctxRYWTimeout, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+LOOPRYW: //RYW = Read Your Writes
+	for {
+		replicaPosition, err := c.proxiedPositionProvider.ReplicaPosition(ctx)
+		if err != nil {
+			slog.Debug("get replica position", "error", err)
+		}
+		slog.Debug("checking positions", "replica", replicaPosition, "currentWritePosition", c.currentWritePosition)
+		if replicaPosition >= c.currentWritePosition {
+			break LOOPRYW
+		}
+
+		select {
+		case <-ctxRYWTimeout.Done():
+			return c.redirectQueryToProxied(ctx, query, args)
+		case <-tickerRYW.C:
+		}
+	}
+	return c.queryContext(ctx, query, args)
+}
+
+type stmtRows struct {
+	driver.Rows
+	stmt driver.Stmt
+}
+
+func (s *stmtRows) Close() error {
+	return errors.Join(s.Rows.Close(), s.stmt.Close())
+}
+
+func (c *Conn) queryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	stmt, err := c.SQLiteConn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	return &stmtRows{Rows: rows, stmt: stmt}, nil
+}
+
+func (c *Conn) updateProxiedPosition(ctx context.Context) {
+	if c.proxiedPositionProvider == nil {
+		return
+	}
+	position, err := c.proxiedPositionProvider.SourcePosition(ctx)
+	if err == nil {
+		c.currentWritePosition = position
+	}
+}
+
+func (c *Conn) redirectExecToGrpc(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	slog.Debug("Redirecting", "to", c.leader.RedirectTarget(), "query", query)
+	params := make([]*sqlv1.NamedValue, len(args))
+	for i, arg := range args {
+		val, err := haconnect.ToAnypb(arg.Value)
+		if err != nil {
+			return nil, err
+		}
+		params[i] = &sqlv1.NamedValue{
+			Name:    arg.Name,
+			Ordinal: int64(arg.Ordinal),
+			Value:   val,
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	select {
+	case c.reqCh <- &sqlv1.QueryRequest{
+		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
+		Sql:           query,
+		Params:        params,
+		ReplicationId: c.replicationID,
+	}:
+		res := <-c.resCh
+		if res.Error != "" {
+			return nil, errors.New(res.Error)
+		}
+		if res.Txseq > 0 {
+			c.txseq = res.Txseq
+		}
+		return result{
+			lastInsertId: res.LastInsertId,
+			rowsAffected: res.RowsAffected,
+		}, nil
+	case <-ctx.Done():
+		if !c.activeTransaction {
+			return nil, driver.ErrBadConn
+		}
+		return nil, ErrTimedOut
+	}
+}
+
+func (c *Conn) proxiedQuerierExecer() ProxiedQuerierExecer {
+	if c.proxiedTxExecer != nil {
+		return c.proxiedTxExecer
+	}
+	return c.proxiedDB
+}
+
+func (c *Conn) redirectQueryToProxied(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	rows, err := c.proxiedQuerierExecer().QueryContext(ctx, query, toSqlValues(args)...)
+	if err != nil {
+		return nil, err
+	}
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	columnsCount := len(columns)
+	if columnsCount == 0 {
+		return nil, fmt.Errorf("no columns")
+	}
+
+	dataRows := make(chan []any, 1)
+	go func() {
+		defer func() {
+			rows.Close()
+			close(dataRows)
+		}()
+		for rows.Next() {
+			values := make([]any, columnsCount)
+			valuePtrs := make([]any, columnsCount)
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+			if err := rows.Scan(valuePtrs...); err != nil {
+				return
+			}
+			for i, val := range values {
+				if b, ok := val.([]uint8); ok {
+					values[i] = string(b)
+				}
+			}
+			dataRows <- values
+		}
+	}()
+
+	return &driverRows{columns: columns, data: dataRows}, nil
+}
+
+type driverRows struct {
+	columns []string
+	data    chan []any
+	index   int
+}
+
+func (r *driverRows) Columns() []string {
+	return r.columns
+}
+
+func (r *driverRows) Next(dest []driver.Value) error {
+	values, ok := <-r.data
+	if !ok {
+		return io.EOF
+	}
+	for i := range len(values) {
+		dest[i] = values[i]
+	}
+	return nil
+}
+
+func (r *driverRows) Close() error {
+	return nil
+}
+
+func (c *Conn) ignoreQueryRouter(ctx context.Context) bool {
+	val := ctx.Value(ignoreQueryRouterKey)
+	if val == nil {
+		return false
+	}
+	return val.(bool)
+}
+
+func (c *Conn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	return c.QueryContext(context.Background(), query, toNamedValues(args))
+}
+
+func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.redirectToGrpc(true) {
+		ctx, cancel := context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+		select {
+		case c.reqCh <- &sqlv1.QueryRequest{
+			Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
+			Sql:           "BEGIN",
+			ReplicationId: c.replicationID,
+		}:
+			res := <-c.resCh
+			if res.Error != "" {
+				return nil, errors.New(res.Error)
+			}
+			c.activeTransaction = true
+			return &txGRPC{
+				Conn: c,
+			}, nil
+		case <-ctx.Done():
+			return nil, driver.ErrBadConn
+		}
+	}
+	if c.proxiedDB != nil && !ha.LocalDB(ctx) {
+		proxiedTx, err := c.proxiedDB.BeginTx(ctx, &sql.TxOptions{
+			Isolation: sql.IsolationLevel(opts.Isolation),
+			ReadOnly:  opts.ReadOnly,
+		})
+		if err != nil {
+			return nil, err
+		}
+		c.proxiedTxExecer = proxiedTx
+		c.activeTransaction = true
+		c.latestTransactionPosition = c.currentWritePosition
+		return &txProxied{
+			Tx: proxiedTx,
+			c:  c,
+		}, nil
+	}
+	tx, err := c.SQLiteConn.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	c.activeTransaction = true
+	return &txLocal{
+		Tx: tx,
+		c:  c,
+	}, nil
+}
+
+func (c *Conn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *Conn) redirectQuery(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	slog.Debug("Redirecting query", "to", c.leader.RedirectTarget(), "query", query)
+	params := make([]*sqlv1.NamedValue, len(args))
+	for i, arg := range args {
+		val, err := haconnect.ToAnypb(arg.Value)
+		if err != nil {
+			return nil, err
+		}
+		params[i] = &sqlv1.NamedValue{
+			Name:    arg.Name,
+			Ordinal: int64(arg.Ordinal),
+			Value:   val,
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	select {
+	case c.reqCh <- &sqlv1.QueryRequest{
+		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_QUERY,
+		Sql:           query,
+		Params:        params,
+		ReplicationId: c.replicationID,
+	}:
+		res := <-c.resCh
+		if res.Error != "" {
+			return nil, errors.New(res.Error)
+		}
+		if res.Txseq > 0 {
+			c.txseq = res.Txseq
+		}
+		return &rows{
+			data: res.ResultSet,
+		}, nil
+	case <-ctx.Done():
+		if c.activeTransaction {
+			return nil, ErrTimedOut
+		}
+		return nil, driver.ErrBadConn
+	}
+}
+
+type txGRPC struct {
+	*Conn
+}
+
+func (tx *txGRPC) Commit() error {
+	select {
+	case tx.reqCh <- &sqlv1.QueryRequest{
+		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
+		Sql:           "COMMIT",
+		ReplicationId: tx.replicationID,
+	}:
+		res := <-tx.resCh
+		if res.Error != "" {
+			return errors.New(res.Error)
+		}
+		tx.Conn.activeTransaction = false
+	case <-time.After(tx.Conn.timeout):
+		return ErrTimedOut
+	}
+
+	return nil
+}
+
+func (tx *txGRPC) Rollback() error {
+	select {
+	case tx.reqCh <- &sqlv1.QueryRequest{
+		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
+		Sql:           "ROLLBACK",
+		ReplicationId: tx.replicationID,
+	}:
+		res := <-tx.resCh
+		if res.Error != "" {
+			return errors.New(res.Error)
+		}
+		tx.Conn.activeTransaction = false
+	case <-time.After(tx.timeout):
+		return ErrTimedOut
+	}
+	return nil
+}
+
+type txLocal struct {
+	driver.Tx
+	c *Conn
+}
+
+func (tx *txLocal) Commit() error {
+	tx.c.activeTransaction = false
+	return tx.Tx.Commit()
+}
+
+func (tx *txLocal) Rollback() error {
+	tx.c.activeTransaction = false
+	return tx.Tx.Rollback()
+}
+
+type txProxied struct {
+	*sql.Tx
+	c *Conn
+}
+
+func (tx *txProxied) Commit() error {
+	tx.c.activeTransaction = false
+	tx.c.proxiedTxExecer = nil
+	return tx.Tx.Commit()
+}
+
+func (tx *txProxied) Rollback() error {
+	tx.c.activeTransaction = false
+	tx.c.proxiedTxExecer = nil
+	tx.c.currentWritePosition = tx.c.latestTransactionPosition
+	return tx.Tx.Rollback()
+}
+
+func (c *Conn) ResetSession(ctx context.Context) error {
+	c.activeTransaction = false
+	c.currentWritePosition = 0
+	c.latestTransactionPosition = 0
+	c.proxiedTxExecer = nil
+	return nil
+}
+
+func (c *Conn) Close() error {
+	var err error
+	if c.grpcClientConn != nil {
+		err = c.grpcClientConn.Close()
+	}
+	return errors.Join(err, c.SQLiteConn.Close())
+}
+
+func (c *Conn) redirectToGrpc(modifies bool) bool {
+	return (modifies || c.activeTransaction) && c.enableRedirect && !c.leader.IsLeader() && c.currentRedirectTarget != ""
+}
+
+func (c *Conn) start() error {
+	if c.leader.IsLeader() {
+		if c.grpcClientConn != nil {
+			c.grpcClientConn.Close()
+		}
+		return nil
+	}
+	target := c.leader.RedirectTarget()
+	lower := strings.ToLower(target)
+	// http(s) protocols are used for the HTTP leader proxy middleware
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return nil
+	}
+	if target == c.currentRedirectTarget {
+		return nil
+	}
+
+	c.currentRedirectTarget = target
+
+	if c.grpcClientConn != nil {
+		c.grpcClientConn.Close()
+	}
+	var err error
+	var dialOpts []grpc.DialOption
+
+	if c.insecure {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
+	}
+
+	if c.token != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcCredentials{token: c.token}))
+	}
+	c.grpcClientConn, err = grpc.NewClient(target, dialOpts...)
+	if err != nil {
+		slog.Debug("connect to grpc", "target", target, "error", err)
+		return driver.ErrBadConn
+	}
+	client := sqlv1.NewDatabaseServiceClient(c.grpcClientConn)
+	stream, err := client.Query(context.Background())
+	if err != nil {
+		slog.Debug("query over grpc", "target", target, "error", err)
+		return driver.ErrBadConn
+	}
+
+	go func() {
+		sesisonTarget := target
+		for {
+			msg, err := stream.Recv()
+			if err == io.EOF {
+				if c.currentRedirectTarget == sesisonTarget {
+					c.invalid = true
+					c.currentRedirectTarget = ""
+				}
+				return // Stream closed
+			}
+			if err != nil {
+				if c.currentRedirectTarget == sesisonTarget {
+					c.invalid = true
+					c.currentRedirectTarget = ""
+				}
+				st, ok := status.FromError(err)
+				if ok && st.Code() != codes.Canceled {
+					slog.Debug("failed to receive message", "error", err)
+					go func() {
+						c.resCh <- &sqlv1.QueryResponse{
+							Error: err.Error(),
+						}
+					}()
+				}
+				return
+			}
+			c.resCh <- msg
+		}
+	}()
+
+	go func() {
+		sesisonTarget := target
+		for {
+			select {
+			case <-time.After(25 * time.Second):
+				err := stream.Send(&sqlv1.QueryRequest{
+					Type: sqlv1.QueryType_QUERY_TYPE_PING,
+				})
+				if err != nil {
+					c.currentRedirectTarget = ""
+					c.activeTransaction = false
+					slog.Debug("failed to send ping", "error", err)
+					if c.currentRedirectTarget == sesisonTarget {
+						c.invalid = true
+						c.currentRedirectTarget = ""
+					}
+					return
+				}
+				<-c.resCh // wait for pong
+			case req := <-c.reqCh:
+				err := stream.Send(req)
+				if err != nil {
+					c.currentRedirectTarget = ""
+					c.activeTransaction = false
+					slog.Debug("failed to send message", "error", err)
+					if c.currentRedirectTarget == sesisonTarget {
+						c.invalid = true
+						c.currentRedirectTarget = ""
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+type grpcCredentials struct {
+	token string
+}
+
+func (c grpcCredentials) GetRequestMetadata(ctx context.Context, in ...string) (map[string]string, error) {
+	return map[string]string{
+		"authorization": c.token,
+	}, nil
+}
+
+func (c grpcCredentials) RequireTransportSecurity() bool {
+	return false
+}
+
+type result struct {
+	lastInsertId int64
+	rowsAffected int64
+}
+
+func (r result) LastInsertId() (int64, error) {
+	return r.lastInsertId, nil
+}
+
+func (r result) RowsAffected() (int64, error) {
+	return r.rowsAffected, nil
+}
+
+type rows struct {
+	data  *sqlv1.Data
+	index int
+}
+
+func (r *rows) Columns() []string {
+	if r.data == nil {
+		return []string{}
+	}
+	return r.data.GetColumns()
+}
+
+func (r *rows) Close() error {
+	r.data = nil
+	return nil
+}
+
+func (r *rows) Next(dest []driver.Value) error {
+	if r.data == nil || r.data.Rows == nil || r.index >= len(r.data.Rows) {
+		return io.EOF
+	}
+	row := r.data.Rows[r.index]
+	for i, val := range row.GetValues() {
+		dest[i] = haconnect.FromAnypb(val)
+	}
+	r.index++
+	return nil
+}
+
+type rawer interface {
+	Raw() driver.Conn
+}
+
+func haSqliteConn(conn *sql.Conn) (*Conn, error) {
+	var haSqliteConn *Conn
+	err := conn.Raw(func(driverConn any) error {
+		switch c := driverConn.(type) {
+		case *Conn:
+			haSqliteConn = c
+			return nil
+		case rawer:
+			switch c2 := c.Raw().(type) {
+			case *Conn:
+				haSqliteConn = c2
+				return nil
+			default:
+				return fmt.Errorf("not a sqlite connection: %T", c2)
+			}
+		default:
+			return fmt.Errorf("not a sqlite connection: %T", conn)
+		}
+	})
+	return haSqliteConn, err
+}
+
+func sqliteConn(conn *sql.Conn) (SQLiteConn, error) {
+	var sqliteConn SQLiteConn
+	err := conn.Raw(func(driverConn any) error {
+		switch c := driverConn.(type) {
+		case *Conn:
+			sqliteConn = c.SQLiteConn
+			return nil
+		case SQLiteConn:
+			sqliteConn = c
+			return nil
+		case rawer:
+			switch c2 := c.Raw().(type) {
+			case *Conn:
+				sqliteConn = c2.SQLiteConn
+				return nil
+			case SQLiteConn:
+				sqliteConn = c2
+				return nil
+			default:
+				return fmt.Errorf("not a sqlite connection: %T", c2)
+			}
+		default:
+			return fmt.Errorf("not a sqlite connection: %T", conn)
+		}
+	})
+	return sqliteConn, err
+}
+
+type sqliteConnWithQuerier struct {
+	SQLiteConn
+}
+
+func (s *sqliteConnWithQuerier) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	stmt, err := s.SQLiteConn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	return &stmtRows{Rows: rows, stmt: stmt}, nil
+}
+
+func sqliteConnQuerierContext(conn *sql.Conn) (*sqliteConnWithQuerier, error) {
+	base, err := sqliteConn(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sqliteConnWithQuerier{SQLiteConn: base}, nil
+}
+
+func toNamedValues(vals []driver.Value) (r []driver.NamedValue) {
+	r = make([]driver.NamedValue, len(vals))
+	for i, val := range vals {
+		r[i] = driver.NamedValue{Value: val, Ordinal: i + 1}
+	}
+	return r
+}
+
+func toSqlValues(vals []driver.NamedValue) (r []any) {
+	if len(vals) == 0 {
+		return nil
+	}
+	if vals[0].Name != "" {
+		r = make([]any, len(vals))
+		for i, val := range vals {
+			r[i] = sql.Named(val.Name, val.Value)
+		}
+		return r
+	}
+	r = make([]any, len(vals))
+	for _, val := range vals {
+		r[val.Ordinal-1] = val.Value
+	}
+	return r
+}
