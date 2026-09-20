@@ -13,7 +13,7 @@ import (
 
 func main() {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
-	db, err := sql.Open("sqlite3-wasm-ha", "file:_examples/node2/my.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&replicationURL=nats://localhost:4223&name=node2&grpcToken=secret-token&grpcInsecure=true&leaderProvider=static:localhost:5001")
+	db, err := sql.Open("sqlite3-wasm-ha", "file:_examples/node2/my.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&replicationURL=nats://localhost:4223&name=node2&grpcToken=secret-token&grpcInsecure=true&leaderProvider=static:localhost:5002")
 	if err != nil {
 		panic(err)
 	}

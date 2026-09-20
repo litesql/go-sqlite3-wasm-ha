@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"regexp"
 	"sync"
-	"time"
 
 	"github.com/litesql/go-ha"
 	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
@@ -18,56 +16,31 @@ import (
 )
 
 type connHooksProvider struct {
-	nodeName             string
-	replicationID        string
-	disableDDLSync       bool
-	publisher            ha.Publisher
-	cdcPublisher         ha.CDCPublisher
-	leader               ha.LeaderProvider
-	txseqTrackerProvider ha.TxSeqTrackerProvider
-	grpcTimeout          time.Duration
-	grpcToken            string
-	grpcInsecure         bool
-	queryRouter          *regexp.Regexp
-}
-
-func newConnHooksProvider(cfg ha.ConnHooksConfig) *connHooksProvider {
-	return &connHooksProvider{
-		nodeName:             cfg.NodeName,
-		replicationID:        cfg.ReplicationID,
-		disableDDLSync:       cfg.DisableDDLSync,
-		publisher:            cfg.Publisher,
-		cdcPublisher:         cfg.CDC,
-		txseqTrackerProvider: cfg.TxSeqTrackerProvider,
-		leader:               cfg.Leader,
-		grpcTimeout:          cfg.GrpcTimeout,
-		grpcToken:            cfg.GrpcToken,
-		grpcInsecure:         cfg.GrpcInsecure,
-		queryRouter:          cfg.QueryRouter,
-	}
+	*ha.Connector
 }
 
 func (p *connHooksProvider) RegisterHooks(c driver.Conn, connector *ha.Connector) (driver.Conn, error) {
+	p.Connector = connector
 	sqliteConn, ok := c.(SQLiteConn)
 	if !ok {
 		slog.Error("connection does not implement SQLiteConn", "type", fmt.Sprintf("%T", c))
 	}
-	enableCDCHooks(sqliteConn, p.nodeName, p.replicationID, p.publisher, p.cdcPublisher)
+	enableCDCHooks(sqliteConn, p.Connector)
 	conn := &Conn{
 		SQLiteConn:              sqliteConn,
-		disableDDLSync:          p.disableDDLSync,
+		disableDDLSync:          p.DisableDDLSync(),
 		enableRedirect:          true,
-		replicationID:           p.replicationID,
-		leader:                  p.leader,
+		replicationID:           p.ReplicationID(),
+		leader:                  p.LeaderProvider(),
 		reqCh:                   make(chan *sqlv1.QueryRequest),
 		resCh:                   make(chan *sqlv1.QueryResponse),
-		txseqTracker:            p.txseqTrackerProvider(),
-		timeout:                 p.grpcTimeout,
-		token:                   p.grpcToken,
-		insecure:                p.grpcInsecure,
+		txseqTracker:            p.Subscriber(),
+		timeout:                 p.GrpcTimeout(),
+		token:                   p.GrpcToken(),
+		insecure:                p.GrpcInsecure(),
 		proxiedDB:               connector.ProxiedDB(),
 		proxiedPositionProvider: connector.ProxiedPositionProvider(),
-		queryRouter:             p.queryRouter,
+		queryRouter:             p.QueryRouter(),
 	}
 	return conn, conn.start()
 }
@@ -89,7 +62,7 @@ func (p *connHooksProvider) EnableHooks(conn *sql.Conn) error {
 	if err != nil {
 		return err
 	}
-	enableCDCHooks(sconn.SQLiteConn, p.nodeName, p.replicationID, p.publisher, p.cdcPublisher)
+	enableCDCHooks(sconn.SQLiteConn, p.Connector)
 	sconn.enableRedirect = true
 	return sconn.start()
 }
@@ -154,8 +127,8 @@ func getTableSchema(sconn SQLiteConn, replicationID string, database string, tab
 
 }
 
-func enableCDCHooks(sconn SQLiteConn, nodeName, replicationID string, publisher ha.Publisher, cdc ha.CDCPublisher) {
-	cs := ha.NewChangeSet(nodeName, replicationID)
+func enableCDCHooks(sconn SQLiteConn, connector *ha.Connector) {
+	cs := ha.NewChangeSet(connector.NodeName(), connector.ReplicationID())
 	changeSetSessionsMu.Lock()
 	changeSetSessions[sconn] = cs
 	changeSetSessionsMu.Unlock()
@@ -164,7 +137,7 @@ func enableCDCHooks(sconn SQLiteConn, nodeName, replicationID string, publisher 
 		if !ok {
 			return
 		}
-		schema, err := getTableSchema(sconn, replicationID, change.Database, change.Table)
+		schema, err := getTableSchema(sconn, connector.ReplicationID(), change.Database, change.Table)
 		if err != nil {
 			slog.Error("failed to read columns", "error", err, "database", change.Database, "table", change.Table)
 			return
@@ -175,14 +148,14 @@ func enableCDCHooks(sconn SQLiteConn, nodeName, replicationID string, publisher 
 	})
 
 	sconn.Raw().CommitHook(func() bool {
-		if err := cs.Send(publisher); err != nil {
+		if err := cs.Send(connector.Publisher()); err != nil {
 			slog.Error("failed to send changeset", "error", err)
 			return false
 		}
-		if cdc != nil {
+		if connector.CDCPublisher() != nil {
 			data := cs.DebeziumData()
 			if len(data) > 0 {
-				if err := cdc.Publish(data); err != nil {
+				if err := connector.CDCPublisher().Publish(data); err != nil {
 					slog.Error("failed to send cdc", "error", err)
 					return false
 				}

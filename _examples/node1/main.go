@@ -16,7 +16,7 @@ func main() {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	c, err := sqliteha.NewConnector("file:_examples/node1/my.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)",
 		ha.WithName("node1"),
-		ha.WithGrpcPort(5001),
+		ha.WithGrpcPort(5002),
 		ha.WithGrpcToken("secret-token"),
 		ha.WithEmbeddedNatsConfig(&ha.EmbeddedNatsConfig{
 			Port: 4223,

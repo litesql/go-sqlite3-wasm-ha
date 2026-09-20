@@ -36,8 +36,8 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 	}
 	opts = append(opts, d.Options...)
 	drv := new(sqlite3.SQLite)
-	return ha.NewConnector(dsn, drv, func(cfg ha.ConnHooksConfig) ha.ConnHooksProvider {
-		return newConnHooksProvider(cfg)
+	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {
+		return &connHooksProvider{}
 	}, Backup, opts...)
 }
 
@@ -48,8 +48,8 @@ func NewConnector(name string, opts ...ha.Option) (*ha.Connector, error) {
 	}
 	opts = append(opts, nameOpts...)
 	drv := new(sqlite3.SQLite)
-	return ha.NewConnector(dsn, drv, func(cfg ha.ConnHooksConfig) ha.ConnHooksProvider {
-		return newConnHooksProvider(cfg)
+	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {
+		return &connHooksProvider{}
 	}, Backup, opts...)
 
 }
