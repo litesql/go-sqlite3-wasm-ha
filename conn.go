@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/litesql/go-ha"
@@ -38,35 +39,27 @@ type ProxiedQuerierExecer interface {
 
 type Conn struct {
 	SQLiteConn
-	disableDDLSync bool
+	connector *ha.Connector
+
 	enableRedirect bool
 
 	currentRedirectTarget string
 	grpcClientConn        *grpc.ClientConn
 
-	leader        ha.LeaderProvider
-	replicationID string
-	reqCh         chan *sqlv1.QueryRequest
-	resCh         chan *sqlv1.QueryResponse
+	reqCh chan *sqlv1.QueryRequest
+	resCh chan *sqlv1.QueryResponse
 
 	txseq uint64
 
 	activeTransaction bool
 
 	txseqTracker ha.TxSeqTracker
-	timeout      time.Duration
-	token        string
-	insecure     bool
 
 	invalid bool
 
-	proxiedDB                 *sql.DB
 	proxiedTxExecer           ProxiedQuerierExecer
-	proxiedPositionProvider   ha.ProxiedPositionProvider
 	currentWritePosition      uint64
 	latestTransactionPosition uint64
-
-	queryRouter *regexp.Regexp
 }
 
 func (c *Conn) Deserialize(b []byte, _ string) error {
@@ -78,7 +71,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		modifies bool
 		stmts    []*ha.Statement
 	)
-	if c.redirectToGrpc(true) || !c.disableDDLSync || c.proxiedDB != nil {
+	if c.redirectToGrpc(true) || !c.connector.DisableDDLSync() || c.connector.ProxiedDB() != nil {
 		var err error
 		stmts, err = ha.Parse(ctx, query)
 		if err != nil {
@@ -90,7 +83,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 						return nil, errors.Join(err, err2)
 					}
 					return res, nil
-				} else if c.proxiedDB != nil {
+				} else if c.connector.ProxiedDB() != nil {
 					slog.Debug("invalid sqlite syntax, redirecting to proxied db", "error", err)
 					res, err2 := c.proxiedQuerierExecer().ExecContext(ctx, query, toSqlValues(args)...)
 					if err2 != nil {
@@ -117,7 +110,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	}
 
 	var ddlCommands strings.Builder
-	if !c.disableDDLSync {
+	if !c.connector.DisableDDLSync() {
 		for _, stmt := range stmts {
 			if stmt.DDL() {
 				ddlCommands.WriteString(stmt.SourceWithIfExists())
@@ -125,7 +118,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		}
 	}
 	if ddlCommands.Len() > 0 {
-		clearTableSchemaCache(c.replicationID)
+		clearTableSchemaCache(c.connector.ReplicationID())
 		if err := addSQLChange(c.SQLiteConn, ddlCommands.String(), nil); err != nil {
 			return nil, err
 		}
@@ -134,7 +127,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 		res driver.Result
 		err error
 	)
-	if c.proxiedDB != nil && modifies && !ha.LocalDB(ctx) {
+	if c.connector.ProxiedDB() != nil && modifies && !ha.LocalDB(ctx) {
 		res, err = c.proxiedQuerierExecer().ExecContext(ctx, query, toSqlValues(args)...)
 		if err == nil {
 			c.updateProxiedPosition(ctx)
@@ -166,7 +159,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 		modifies bool
 		stmts    []*ha.Statement
 	)
-	if c.redirectToGrpc(true) || !c.disableDDLSync || c.proxiedDB != nil {
+	if c.redirectToGrpc(true) || !c.connector.DisableDDLSync() || c.connector.ProxiedDB() != nil {
 		var err error
 		stmts, err = ha.Parse(ctx, query)
 		if err != nil {
@@ -177,7 +170,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 					return nil, errors.Join(err, err2)
 				}
 				return res, nil
-			} else if c.proxiedDB != nil {
+			} else if c.connector.ProxiedDB() != nil {
 				slog.Debug("invalid sqlite syntax, redirecting to proxied db", "error", err)
 				res, err2 := c.redirectQueryToProxied(ctx, query, args)
 				if err2 != nil {
@@ -202,7 +195,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 
-	ctxTimeout, cancel := context.WithTimeout(ctx, c.timeout)
+	ctxTimeout, cancel := context.WithTimeout(ctx, c.connector.GrpcTimeout())
 	defer cancel()
 LOOP:
 	for {
@@ -217,7 +210,7 @@ LOOP:
 		}
 	}
 	if len(stmts) == 1 && !c.ignoreQueryRouter(ctx) {
-		qr := c.queryRouter
+		qr := c.connector.QueryRouter()
 		queryRouterExp := queryRouterHintMatcher(query)
 		if len(queryRouterExp) == 2 {
 			if exp, err := regexp.Compile(strings.TrimSpace(queryRouterExp[1])); err == nil {
@@ -230,7 +223,7 @@ LOOP:
 			})
 		}
 	}
-	if c.proxiedDB != nil && (modifies || c.activeTransaction) {
+	if c.connector.ProxiedDB() != nil && (modifies || c.activeTransaction) {
 		rows, err := c.redirectQueryToProxied(ctx, query, args)
 		if err != nil {
 			return nil, err
@@ -241,7 +234,7 @@ LOOP:
 		return rows, err
 	}
 
-	if c.currentWritePosition == 0 || c.proxiedDB == nil {
+	if c.currentWritePosition == 0 || c.connector.ProxiedDB() == nil {
 		stmt, err := c.SQLiteConn.PrepareContext(ctx, query)
 		if err != nil {
 			return nil, err
@@ -252,11 +245,11 @@ LOOP:
 	tickerRYW := time.NewTicker(time.Millisecond)
 	defer tickerRYW.Stop()
 
-	ctxRYWTimeout, cancel := context.WithTimeout(ctx, c.timeout)
+	ctxRYWTimeout, cancel := context.WithTimeout(ctx, c.connector.GrpcTimeout())
 	defer cancel()
 LOOPRYW: //RYW = Read Your Writes
 	for {
-		replicaPosition, err := c.proxiedPositionProvider.ReplicaPosition(ctx)
+		replicaPosition, err := c.connector.ProxiedPositionProvider().ReplicaPosition(ctx)
 		if err != nil {
 			slog.Debug("get replica position", "error", err)
 		}
@@ -296,17 +289,17 @@ func (c *Conn) queryContext(ctx context.Context, query string, args []driver.Nam
 }
 
 func (c *Conn) updateProxiedPosition(ctx context.Context) {
-	if c.proxiedPositionProvider == nil {
+	if c.connector.ProxiedPositionProvider() == nil {
 		return
 	}
-	position, err := c.proxiedPositionProvider.SourcePosition(ctx)
+	position, err := c.connector.ProxiedPositionProvider().SourcePosition(ctx)
 	if err == nil {
 		c.currentWritePosition = position
 	}
 }
 
 func (c *Conn) redirectExecToGrpc(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	slog.Debug("Redirecting", "to", c.leader.RedirectTarget(), "query", query)
+	slog.Debug("Redirecting", "to", c.connector.LeaderProvider().RedirectTarget(), "query", query)
 	params := make([]*sqlv1.NamedValue, len(args))
 	for i, arg := range args {
 		val, err := haconnect.ToAnypb(arg.Value)
@@ -319,7 +312,7 @@ func (c *Conn) redirectExecToGrpc(ctx context.Context, query string, args []driv
 			Value:   val,
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	ctx, cancel := context.WithTimeout(ctx, c.connector.GrpcTimeout())
 	defer cancel()
 
 	select {
@@ -327,7 +320,7 @@ func (c *Conn) redirectExecToGrpc(ctx context.Context, query string, args []driv
 		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 		Sql:           query,
 		Params:        params,
-		ReplicationId: c.replicationID,
+		ReplicationId: c.connector.ReplicationID(),
 	}:
 		res := <-c.resCh
 		if res.Error != "" {
@@ -352,7 +345,7 @@ func (c *Conn) proxiedQuerierExecer() ProxiedQuerierExecer {
 	if c.proxiedTxExecer != nil {
 		return c.proxiedTxExecer
 	}
-	return c.proxiedDB
+	return c.connector.ProxiedDB()
 }
 
 func (c *Conn) redirectQueryToProxied(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -437,13 +430,13 @@ func (c *Conn) Query(query string, args []driver.Value) (driver.Rows, error) {
 
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if c.redirectToGrpc(true) {
-		ctx, cancel := context.WithTimeout(ctx, c.timeout)
+		ctx, cancel := context.WithTimeout(ctx, c.connector.GrpcTimeout())
 		defer cancel()
 		select {
 		case c.reqCh <- &sqlv1.QueryRequest{
 			Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 			Sql:           "BEGIN",
-			ReplicationId: c.replicationID,
+			ReplicationId: c.connector.ReplicationID(),
 		}:
 			res := <-c.resCh
 			if res.Error != "" {
@@ -457,8 +450,8 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 			return nil, driver.ErrBadConn
 		}
 	}
-	if c.proxiedDB != nil && !ha.LocalDB(ctx) {
-		proxiedTx, err := c.proxiedDB.BeginTx(ctx, &sql.TxOptions{
+	if c.connector.ProxiedDB() != nil && !ha.LocalDB(ctx) {
+		proxiedTx, err := c.connector.ProxiedDB().BeginTx(ctx, &sql.TxOptions{
 			Isolation: sql.IsolationLevel(opts.Isolation),
 			ReadOnly:  opts.ReadOnly,
 		})
@@ -489,7 +482,7 @@ func (c *Conn) Begin() (driver.Tx, error) {
 }
 
 func (c *Conn) redirectQuery(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	slog.Debug("Redirecting query", "to", c.leader.RedirectTarget(), "query", query)
+	slog.Debug("Redirecting query", "to", c.connector.LeaderProvider().RedirectTarget(), "query", query)
 	params := make([]*sqlv1.NamedValue, len(args))
 	for i, arg := range args {
 		val, err := haconnect.ToAnypb(arg.Value)
@@ -502,14 +495,14 @@ func (c *Conn) redirectQuery(ctx context.Context, query string, args []driver.Na
 			Value:   val,
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	ctx, cancel := context.WithTimeout(ctx, c.connector.GrpcTimeout())
 	defer cancel()
 	select {
 	case c.reqCh <- &sqlv1.QueryRequest{
 		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_QUERY,
 		Sql:           query,
 		Params:        params,
-		ReplicationId: c.replicationID,
+		ReplicationId: c.connector.ReplicationID(),
 	}:
 		res := <-c.resCh
 		if res.Error != "" {
@@ -538,14 +531,14 @@ func (tx *txGRPC) Commit() error {
 	case tx.reqCh <- &sqlv1.QueryRequest{
 		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 		Sql:           "COMMIT",
-		ReplicationId: tx.replicationID,
+		ReplicationId: tx.connector.ReplicationID(),
 	}:
 		res := <-tx.resCh
 		if res.Error != "" {
 			return errors.New(res.Error)
 		}
 		tx.Conn.activeTransaction = false
-	case <-time.After(tx.Conn.timeout):
+	case <-time.After(tx.Conn.connector.GrpcTimeout()):
 		return ErrTimedOut
 	}
 
@@ -557,14 +550,14 @@ func (tx *txGRPC) Rollback() error {
 	case tx.reqCh <- &sqlv1.QueryRequest{
 		Type:          sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 		Sql:           "ROLLBACK",
-		ReplicationId: tx.replicationID,
+		ReplicationId: tx.connector.ReplicationID(),
 	}:
 		res := <-tx.resCh
 		if res.Error != "" {
 			return errors.New(res.Error)
 		}
 		tx.Conn.activeTransaction = false
-	case <-time.After(tx.timeout):
+	case <-time.After(tx.connector.GrpcTimeout()):
 		return ErrTimedOut
 	}
 	return nil
@@ -619,18 +612,22 @@ func (c *Conn) Close() error {
 	return errors.Join(err, c.SQLiteConn.Close())
 }
 
+func (c *Conn) Mutex() *sync.Mutex {
+	return c.connector.Mutex()
+}
+
 func (c *Conn) redirectToGrpc(modifies bool) bool {
-	return (modifies || c.activeTransaction) && c.enableRedirect && !c.leader.IsLeader() && c.currentRedirectTarget != ""
+	return (modifies || c.activeTransaction) && c.enableRedirect && !c.connector.LeaderProvider().IsLeader() && c.currentRedirectTarget != ""
 }
 
 func (c *Conn) start() error {
-	if c.leader.IsLeader() {
+	if c.connector.LeaderProvider().IsLeader() {
 		if c.grpcClientConn != nil {
 			c.grpcClientConn.Close()
 		}
 		return nil
 	}
-	target := c.leader.RedirectTarget()
+	target := c.connector.LeaderProvider().RedirectTarget()
 	lower := strings.ToLower(target)
 	// http(s) protocols are used for the HTTP leader proxy middleware
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
@@ -648,14 +645,14 @@ func (c *Conn) start() error {
 	var err error
 	var dialOpts []grpc.DialOption
 
-	if c.insecure {
+	if c.connector.GrpcInsecure() {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
 	}
 
-	if c.token != "" {
-		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcCredentials{token: c.token}))
+	if c.connector.GrpcToken() != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(grpcCredentials{token: c.connector.GrpcToken()}))
 	}
 	c.grpcClientConn, err = grpc.NewClient(target, dialOpts...)
 	if err != nil {
