@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"strings"
 	"sync"
 	_ "unsafe"
 
@@ -29,11 +30,25 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 	return connector.Connect(context.Background())
 }
 
+func normalizeDSN(dsn string) string {
+	if dsn == ":memory:" {
+		return "file::memory:?cache=shared"
+	}
+	if strings.HasPrefix(dsn, "file::memory:") && !strings.Contains(dsn, "cache=shared") {
+		if strings.Contains(dsn, "?") {
+			return dsn + "&cache=shared"
+		}
+		return dsn + "?cache=shared"
+	}
+	return dsn
+}
+
 func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 	dsn, opts, err := ha.NameToOptions(name, "sqlite3")
 	if err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
+	dsn = normalizeDSN(dsn)
 	opts = append(opts, d.Options...)
 	drv := new(sqlite3.SQLite)
 	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {
@@ -46,6 +61,7 @@ func NewConnector(name string, opts ...ha.Option) (*ha.Connector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
+	dsn = normalizeDSN(dsn)
 	opts = append(opts, nameOpts...)
 	drv := new(sqlite3.SQLite)
 	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {

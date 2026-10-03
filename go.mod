@@ -3,7 +3,7 @@ module github.com/litesql/go-sqlite3-wasm-ha
 go 1.26.0
 
 require (
-	github.com/litesql/go-ha v0.13.14
+	github.com/litesql/go-ha v0.13.19
 	github.com/ncruces/go-sqlite3 v0.35.6
 	google.golang.org/grpc v1.84.0
 )
@@ -25,6 +25,7 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/ncruces/go-sqlite3-wasm/v6 v6.3.35304 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
+	github.com/ncruces/wbt v1.0.0 // indirect
 	github.com/rqlite/sql v0.0.0-20260224021119-1b2524a41372 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
