@@ -225,6 +225,15 @@ type fakePublisher struct {
 	sequence uint64
 }
 
+func (f *fakePublisher) Publish(ctx context.Context, cs *ha.ChangeSet) error {
+	f.changes = cs.Changes
+	return f.err
+}
+
+func (f *fakePublisher) Sequence() uint64 {
+	return f.sequence
+}
+
 type fakeTwoPhasePublisher struct {
 	prepares        int
 	commits         int
@@ -235,7 +244,7 @@ type fakeTwoPhasePublisher struct {
 	recoveries      int
 }
 
-func (f *fakeTwoPhasePublisher) Publish(*ha.ChangeSet) error {
+func (f *fakeTwoPhasePublisher) Publish(context.Context, *ha.ChangeSet) error {
 	f.legacyPublishes++
 	return nil
 }
@@ -254,12 +263,12 @@ func (f *fakeTwoPhasePublisher) BindLocalDB(db *sql.DB) error {
 	return err
 }
 
-func (f *fakeTwoPhasePublisher) RecoverTwoPhaseCommits() error {
+func (f *fakeTwoPhasePublisher) RecoverTwoPhaseCommits(context.Context) error {
 	f.recoveries++
 	return nil
 }
 
-func (f *fakeTwoPhasePublisher) PrepareTwoPhaseCommit(*ha.ChangeSet) (ha.PreparedTwoPhaseCommit, error) {
+func (f *fakeTwoPhasePublisher) PrepareTwoPhaseCommit(context.Context, *ha.ChangeSet) (ha.PreparedTwoPhaseCommit, error) {
 	f.prepares++
 	return &fakePreparedTwoPhaseCommit{publisher: f, transactionID: fmt.Sprintf("fake-tx-%d", f.prepares)}, nil
 }
@@ -269,16 +278,16 @@ type fakePreparedTwoPhaseCommit struct {
 	transactionID string
 }
 
-func (f *fakePreparedTwoPhaseCommit) RecordCommitDecision(write ha.TwoPhaseCommitDecisionWriter) error {
-	return write(context.Background(), `INSERT INTO ha_2pc_decisions(transaction_id, changeset, workers) VALUES(?, ?, ?)`, f.transactionID, []byte("{}"), []byte("{}"))
+func (f *fakePreparedTwoPhaseCommit) RecordCommitDecision(ctx context.Context, write ha.TwoPhaseCommitDecisionWriter) error {
+	return write(ctx, `INSERT INTO ha_2pc_decisions(transaction_id, changeset, workers) VALUES(?, ?, ?)`, f.transactionID, []byte("{}"), []byte("{}"))
 }
 
-func (f *fakePreparedTwoPhaseCommit) Commit() error {
+func (f *fakePreparedTwoPhaseCommit) Commit(ctx context.Context) error {
 	f.publisher.commits++
 	if f.publisher.failAt == f.publisher.commits {
 		return errors.New("worker commit unavailable")
 	}
-	_, err := f.publisher.localDB.ExecContext(context.Background(), "DELETE FROM ha_2pc_decisions WHERE transaction_id = ?", f.transactionID)
+	_, err := f.publisher.localDB.ExecContext(ctx, "DELETE FROM ha_2pc_decisions WHERE transaction_id = ?", f.transactionID)
 	if err != nil {
 		return err
 	}
@@ -290,17 +299,8 @@ func (f *fakePreparedTwoPhaseCommit) Abort() error {
 	return nil
 }
 
-func (f *fakePreparedTwoPhaseCommit) ResolveCommit() (bool, error) {
+func (f *fakePreparedTwoPhaseCommit) ResolveCommit(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
 func (f *fakePreparedTwoPhaseCommit) Close() {}
-
-func (f *fakePublisher) Publish(cs *ha.ChangeSet) error {
-	f.changes = cs.Changes
-	return f.err
-}
-
-func (f *fakePublisher) Sequence() uint64 {
-	return f.sequence
-}
