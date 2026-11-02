@@ -23,8 +23,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
-github.com/litesql/go-ha v0.15.3 h1:tofi0V1x0uqI7alvQgAFPSbsDm8YMgzCgsKrgFttK+Q=
-github.com/litesql/go-ha v0.15.3/go.mod h1:nybvsXXsomo1NwOBR1joD8/QHxLuEjj7PY+wubO21i0=
+github.com/litesql/go-ha v0.15.5 h1:ejxWwDWPg5Y5z7u8IfHLCQ9+4pSh5Bpi1KILN/R2dlM=
+github.com/litesql/go-ha v0.15.5/go.mod h1:nybvsXXsomo1NwOBR1joD8/QHxLuEjj7PY+wubO21i0=
 github.com/minio/highwayhash v1.0.4 h1:asJizugGgchQod2ja9NJlGOWq4s7KsAWr5XUc9Clgl4=
 github.com/minio/highwayhash v1.0.4/go.mod h1:GGYsuwP/fPD6Y9hMiXuapVvlIUEhFhMTh0rxU3ik1LQ=
 github.com/nats-io/graft v0.0.0-20260325174230-f9e6710ae36e h1:DddEGp8zDDnSZfhPwfK3nEIEzEf8eRN1gZh27CIMMoE=
