@@ -3,7 +3,7 @@ module github.com/litesql/go-sqlite3-wasm-ha
 go 1.26.0
 
 require (
-	github.com/litesql/go-ha v0.15.5
+	github.com/litesql/go-ha v0.15.7
 	github.com/nats-io/nats-server/v2 v2.15.2
 	github.com/nats-io/nats.go v1.55.0
 	github.com/ncruces/go-sqlite3 v0.36.0
@@ -29,9 +29,9 @@ require (
 	github.com/minio/highwayhash v1.0.4 // indirect
 	github.com/nats-io/graft v0.0.0-20260325174230-f9e6710ae36e // indirect
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
-	github.com/nats-io/nkeys v0.4.16 // indirect
+	github.com/nats-io/nkeys v0.4.17 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/ncruces/go-sqlite3-wasm/v6 v6.4.35401 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.5.35401 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/ncruces/wbt v1.0.0 // indirect
 	github.com/rqlite/sql v0.0.0-20261016220845-5c0832fea6e1 // indirect
@@ -42,6 +42,6 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261104224025-d1e00e9f33ab // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

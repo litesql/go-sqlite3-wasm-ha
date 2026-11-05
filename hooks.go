@@ -16,7 +16,6 @@ import (
 )
 
 type connHooksProvider struct {
-	*ha.Connector
 }
 
 func (p *connHooksProvider) RegisterHooks(c driver.Conn, connector *ha.Connector) (driver.Conn, error) {
@@ -24,7 +23,6 @@ func (p *connHooksProvider) RegisterHooks(c driver.Conn, connector *ha.Connector
 	if err != nil {
 		return nil, fmt.Errorf("initialize SQLite telemetry: %w", err)
 	}
-	p.Connector = connector
 	sqliteConn, ok := c.(SQLiteConn)
 	if !ok {
 		slog.Error("connection does not implement SQLiteConn", "type", fmt.Sprintf("%T", c))
@@ -36,9 +34,9 @@ func (p *connHooksProvider) RegisterHooks(c driver.Conn, connector *ha.Connector
 		enableRedirect: true,
 		reqCh:          make(chan *sqlv1.QueryRequest),
 		resCh:          make(chan *sqlv1.QueryResponse),
-		txseqTracker:   p.Subscriber(),
+		txseqTracker:   connector.Subscriber(),
 	}
-	enableCDCHooks(conn, p.Connector)
+	enableCDCHooks(conn)
 	return conn, conn.start()
 }
 
@@ -59,7 +57,7 @@ func (p *connHooksProvider) EnableHooks(conn *sql.Conn) error {
 	if err != nil {
 		return err
 	}
-	enableCDCHooks(sconn, p.Connector)
+	enableCDCHooks(sconn)
 	sconn.enableRedirect = true
 	return sconn.start()
 }
@@ -68,23 +66,27 @@ type tableSchema struct {
 	columns, types, pkColumns []string
 }
 
-var tableSchemaCache = make(map[string]map[string]*tableSchema)
+var (
+	tableSchemaCache   = make(map[string]map[string]*tableSchema)
+	tableSchemaCacheMu sync.RWMutex
+)
 
 func clearTableSchemaCache(replicationID string) {
+	tableSchemaCacheMu.Lock()
 	delete(tableSchemaCache, replicationID)
+	tableSchemaCacheMu.Unlock()
 }
 
 func getTableSchema(sconn SQLiteConn, replicationID string, database string, table string) (*tableSchema, error) {
 	key := fmt.Sprintf("%s.%s", database, table)
-	replicationTables, ok := tableSchemaCache[replicationID]
-	if !ok {
-		replicationTables = map[string]*tableSchema{}
-		tableSchemaCache[replicationID] = replicationTables
-	} else {
+	tableSchemaCacheMu.RLock()
+	if replicationTables, ok := tableSchemaCache[replicationID]; ok {
 		if schema, ok := replicationTables[key]; ok {
+			tableSchemaCacheMu.RUnlock()
 			return schema, nil
 		}
 	}
+	tableSchemaCacheMu.RUnlock()
 	var schema tableSchema
 	stmt, err := sconn.PrepareContext(context.Background(), fmt.Sprintf("SELECT name, type, pk FROM %s.PRAGMA_TABLE_INFO('%s') ORDER BY cid", database, table))
 	if err != nil {
@@ -119,13 +121,19 @@ func getTableSchema(sconn SQLiteConn, replicationID string, database string, tab
 			schema.pkColumns = append(schema.pkColumns, dataRow[0].(string))
 		}
 	}
+	tableSchemaCacheMu.Lock()
+	replicationTables, ok := tableSchemaCache[replicationID]
+	if !ok {
+		replicationTables = make(map[string]*tableSchema)
+		tableSchemaCache[replicationID] = replicationTables
+	}
 	replicationTables[key] = &schema
+	tableSchemaCacheMu.Unlock()
 	return &schema, nil
-
 }
 
-func enableCDCHooks(sconn *Conn, connector *ha.Connector) {
-	cs := ha.NewChangeSet(connector.NodeName(), connector.ReplicationID())
+func enableCDCHooks(sconn *Conn) {
+	cs := ha.NewChangeSet(sconn.connector.NodeName(), sconn.connector.ReplicationID())
 	changeSetSessionsMu.Lock()
 	changeSetSessions[sconn.SQLiteConn] = cs
 	changeSetSessionsMu.Unlock()
@@ -137,7 +145,7 @@ func enableCDCHooks(sconn *Conn, connector *ha.Connector) {
 		if !ok {
 			return
 		}
-		schema, err := getTableSchema(sconn.SQLiteConn, connector.ReplicationID(), change.Database, change.Table)
+		schema, err := getTableSchema(sconn.SQLiteConn, sconn.connector.ReplicationID(), change.Database, change.Table)
 		if err != nil {
 			slog.Error("failed to read columns", "error", err, "database", change.Database, "table", change.Table)
 			return
@@ -148,17 +156,17 @@ func enableCDCHooks(sconn *Conn, connector *ha.Connector) {
 	})
 
 	sconn.Raw().CommitHook(func() bool {
-		if _, ok := connector.Publisher().(ha.TwoPhaseCommitPreparer); ok {
+		if _, ok := sconn.connector.Publisher().(ha.TwoPhaseCommitPreparer); ok {
 			return true
 		}
-		if err := cs.Send(sconn.Context(), connector.Publisher()); err != nil {
+		if err := cs.Send(sconn.Context(), sconn.connector.Publisher()); err != nil {
 			slog.Error("failed to send changeset", "error", err)
 			return false
 		}
-		if connector.CDCPublisher() != nil {
+		if sconn.connector.CDCPublisher() != nil {
 			data := cs.DebeziumData()
 			if len(data) > 0 {
-				if err := connector.CDCPublisher().Publish(data); err != nil {
+				if err := sconn.connector.CDCPublisher().Publish(data); err != nil {
 					slog.Error("failed to send cdc", "error", err)
 					return false
 				}
