@@ -2,182 +2,13 @@ package sqliteha
 
 import (
 	"context"
-	"database/sql"
 	"database/sql/driver"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"sync"
 
 	"github.com/litesql/go-ha"
-	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
 	sqlite3 "github.com/ncruces/go-sqlite3"
 )
-
-type connHooksProvider struct {
-}
-
-func (p *connHooksProvider) RegisterHooks(c driver.Conn, connector *ha.Connector) (driver.Conn, error) {
-	telemetry, err := defaultSQLiteTelemetry()
-	if err != nil {
-		return nil, fmt.Errorf("initialize SQLite telemetry: %w", err)
-	}
-	sqliteConn, ok := c.(SQLiteConn)
-	if !ok {
-		slog.Error("connection does not implement SQLiteConn", "type", fmt.Sprintf("%T", c))
-	}
-	conn := &Conn{
-		SQLiteConn:     sqliteConn,
-		connector:      connector,
-		telemetry:      telemetry,
-		enableRedirect: true,
-		reqCh:          make(chan *sqlv1.QueryRequest),
-		resCh:          make(chan *sqlv1.QueryResponse),
-		txseqTracker:   connector.Subscriber(),
-	}
-	enableCDCHooks(conn)
-	return conn, conn.start()
-}
-
-func (p *connHooksProvider) DisableHooks(conn *sql.Conn) error {
-	sconn, err := haSqliteConn(conn)
-	if err != nil {
-		return err
-	}
-	sconn.Raw().PreUpdateHook(nil)
-	sconn.Raw().CommitHook(nil)
-	sconn.Raw().RollbackHook(nil)
-	sconn.enableRedirect = false
-	return nil
-}
-
-func (p *connHooksProvider) EnableHooks(conn *sql.Conn) error {
-	sconn, err := haSqliteConn(conn)
-	if err != nil {
-		return err
-	}
-	enableCDCHooks(sconn)
-	sconn.enableRedirect = true
-	return sconn.start()
-}
-
-type tableSchema struct {
-	columns, types, pkColumns []string
-}
-
-var (
-	tableSchemaCache   = make(map[string]map[string]*tableSchema)
-	tableSchemaCacheMu sync.RWMutex
-)
-
-func clearTableSchemaCache(replicationID string) {
-	tableSchemaCacheMu.Lock()
-	delete(tableSchemaCache, replicationID)
-	tableSchemaCacheMu.Unlock()
-}
-
-func getTableSchema(sconn SQLiteConn, replicationID string, database string, table string) (*tableSchema, error) {
-	key := fmt.Sprintf("%s.%s", database, table)
-	tableSchemaCacheMu.RLock()
-	if replicationTables, ok := tableSchemaCache[replicationID]; ok {
-		if schema, ok := replicationTables[key]; ok {
-			tableSchemaCacheMu.RUnlock()
-			return schema, nil
-		}
-	}
-	tableSchemaCacheMu.RUnlock()
-	var schema tableSchema
-	stmt, err := sconn.PrepareContext(context.Background(), fmt.Sprintf("SELECT name, type, pk FROM %s.PRAGMA_TABLE_INFO('%s') ORDER BY cid", database, table))
-	if err != nil {
-		return nil, fmt.Errorf("failed to prepare statement: %w", err)
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	rows.Columns()
-	for {
-
-		dataRow := []driver.Value{new(string), new(string), new(int64)}
-		err := rows.Next(dataRow)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				slog.Error("failed to read table columns", "error", err, "table", table)
-			}
-			break
-		}
-		if v, ok := dataRow[0].(string); ok {
-			schema.columns = append(schema.columns, v)
-		} else {
-			continue
-		}
-		if v, ok := dataRow[1].(string); ok {
-			schema.types = append(schema.types, v)
-		}
-		if v, ok := dataRow[2].(int64); ok && v > 0 {
-			schema.pkColumns = append(schema.pkColumns, dataRow[0].(string))
-		}
-	}
-	tableSchemaCacheMu.Lock()
-	replicationTables, ok := tableSchemaCache[replicationID]
-	if !ok {
-		replicationTables = make(map[string]*tableSchema)
-		tableSchemaCache[replicationID] = replicationTables
-	}
-	replicationTables[key] = &schema
-	tableSchemaCacheMu.Unlock()
-	return &schema, nil
-}
-
-func enableCDCHooks(sconn *Conn) {
-	cs := ha.NewChangeSet(sconn.connector.NodeName(), sconn.connector.ReplicationID())
-	changeSetSessionsMu.Lock()
-	changeSetSessions[sconn.SQLiteConn] = cs
-	changeSetSessionsMu.Unlock()
-	sconn.Raw().PreUpdateHook(func(d sqlite3.PreUpdateData) {
-		if d.Table == ha.TwoPhaseCommitDecisionTable || d.Table == ha.OutboxTable {
-			return
-		}
-		change, ok := getChange(&d)
-		if !ok {
-			return
-		}
-		schema, err := getTableSchema(sconn.SQLiteConn, sconn.connector.ReplicationID(), change.Database, change.Table)
-		if err != nil {
-			slog.Error("failed to read columns", "error", err, "database", change.Database, "table", change.Table)
-			return
-		}
-		change.Columns = schema.columns
-		change.PKColumns = schema.pkColumns
-		cs.AddChange(change)
-	})
-
-	sconn.Raw().CommitHook(func() bool {
-		if _, ok := sconn.connector.Publisher().(ha.TwoPhaseCommitPreparer); ok {
-			return true
-		}
-		if err := cs.Send(sconn.Context(), sconn.connector.Publisher()); err != nil {
-			slog.Error("failed to send changeset", "error", err)
-			return false
-		}
-		if sconn.connector.CDCPublisher() != nil {
-			data := cs.DebeziumData()
-			if len(data) > 0 {
-				if err := sconn.connector.CDCPublisher().Publish(data); err != nil {
-					slog.Error("failed to send cdc", "error", err)
-					return false
-				}
-			}
-		}
-		return true
-	})
-	sconn.Raw().RollbackHook(func() {
-		cs.Clear()
-	})
-}
 
 type execQuerier interface {
 	ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error)
@@ -192,73 +23,49 @@ type SQLiteConn interface {
 	driver.ConnPrepareContext
 }
 
-var (
-	changeSetSessions   = make(map[SQLiteConn]*ha.ChangeSet)
-	changeSetSessionsMu sync.RWMutex
-)
+type wasmConn struct {
+	SQLiteConn
+}
 
-func addSQLChange(conn SQLiteConn, sql string, args []any) error {
-	changeSetSessionsMu.RLock()
-	defer changeSetSessionsMu.RUnlock()
+func (c wasmConn) Deserialize(b []byte, _ string) error {
+	return fmt.Errorf("Not implemented")
+}
 
-	cs := changeSetSessions[conn]
-	if cs == nil {
-		return errors.New("no changeset session for the connection")
+func (c wasmConn) UnwrapSQLiteConn() driver.Conn {
+	return c.SQLiteConn
+}
+
+type hooksAdapter struct{}
+
+func (a *hooksAdapter) WrapConn(c driver.Conn, _ *ha.Connector) (ha.SQLiteConn, error) {
+	sqliteConn, ok := c.(SQLiteConn)
+	if !ok {
+		return nil, fmt.Errorf("connection does not implement SQLiteConn: %T", c)
 	}
-	cs.AddChange(ha.Change{
-		Operation: "SQL",
-		Command:   sql,
-		Args:      args,
+	return wasmConn{SQLiteConn: sqliteConn}, nil
+}
+
+func (a *hooksAdapter) EnableHooks(conn ha.SQLiteConn, cb ha.HookCallbacks) {
+	sconn := conn.(wasmConn).SQLiteConn
+	sconn.Raw().PreUpdateHook(func(d sqlite3.PreUpdateData) {
+		if d.Table == ha.TwoPhaseCommitDecisionTable || d.Table == ha.OutboxTable {
+			return
+		}
+		if change, ok := getChange(&d); ok {
+			cb.OnPreUpdate(change)
+		}
 	})
-	return nil
+	sconn.Raw().CommitHook(func() bool {
+		return cb.OnCommit() == nil
+	})
+	sconn.Raw().RollbackHook(cb.OnRollback)
 }
 
-func removeLastChange(conn SQLiteConn) error {
-	changeSetSessionsMu.RLock()
-	defer changeSetSessionsMu.RUnlock()
-
-	cs := changeSetSessions[conn]
-	if cs == nil {
-		return errors.New("no changeset session for the connection")
-	}
-	if len(cs.Changes) > 0 {
-		cs.Changes = cs.Changes[:len(cs.Changes)-1]
-	}
-	return nil
-}
-
-func snapshotChangeSet(conn SQLiteConn) *ha.ChangeSet {
-	changeSetSessionsMu.RLock()
-	defer changeSetSessionsMu.RUnlock()
-
-	cs := changeSetSessions[conn]
-	if cs == nil {
-		return nil
-	}
-	snapshot := *cs
-	snapshot.Changes = append([]ha.Change(nil), cs.Changes...)
-	return &snapshot
-}
-
-func clearChangeSet(conn SQLiteConn) {
-	changeSetSessionsMu.RLock()
-	defer changeSetSessionsMu.RUnlock()
-	if cs := changeSetSessions[conn]; cs != nil {
-		cs.Clear()
-	}
-}
-
-func publishChangeSetCDC(connector *ha.Connector, cs *ha.ChangeSet) {
-	if connector.CDCPublisher() == nil {
-		return
-	}
-	data := cs.DebeziumData()
-	if len(data) == 0 {
-		return
-	}
-	if err := connector.CDCPublisher().Publish(data); err != nil {
-		slog.Error("failed to send cdc after local commit", "error", err)
-	}
+func (a *hooksAdapter) DisableHooks(conn ha.SQLiteConn) {
+	sconn := conn.(wasmConn).SQLiteConn
+	sconn.Raw().PreUpdateHook(nil)
+	sconn.Raw().CommitHook(nil)
+	sconn.Raw().RollbackHook(nil)
 }
 
 func getChange(d *sqlite3.PreUpdateData) (c ha.Change, ok bool) {

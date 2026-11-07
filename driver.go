@@ -13,6 +13,13 @@ import (
 	sqlite3 "github.com/ncruces/go-sqlite3/driver"
 )
 
+var ErrTimedOut = ha.ErrTimedOut
+
+type (
+	Conn                 = ha.Conn
+	ProxiedQuerierExecer = ha.ProxiedQuerierExecer
+)
+
 func init() {
 	sql.Register("sqlite3-wasm-ha", &Driver{})
 }
@@ -52,7 +59,7 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 	opts = append(opts, d.Options...)
 	drv := new(sqlite3.SQLite)
 	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {
-		return &connHooksProvider{}
+		return ha.NewSQLiteHooksProvider(&hooksAdapter{})
 	}, Backup, opts...)
 }
 
@@ -65,7 +72,6 @@ func NewConnector(name string, opts ...ha.Option) (*ha.Connector, error) {
 	opts = append(opts, nameOpts...)
 	drv := new(sqlite3.SQLite)
 	return ha.NewConnector(dsn, drv, func() ha.ConnHooksProvider {
-		return &connHooksProvider{}
+		return ha.NewSQLiteHooksProvider(&hooksAdapter{})
 	}, Backup, opts...)
-
 }
