@@ -48,7 +48,7 @@ func (a *hooksAdapter) WrapConn(c driver.Conn, _ *ha.Connector) (ha.SQLiteConn, 
 func (a *hooksAdapter) EnableHooks(conn ha.SQLiteConn, cb ha.HookCallbacks) {
 	sconn := conn.(wasmConn).SQLiteConn
 	sconn.Raw().PreUpdateHook(func(d sqlite3.PreUpdateData) {
-		if d.Table == ha.TwoPhaseCommitDecisionTable || d.Table == ha.OutboxTable {
+		if d.Table == ha.TwoPhaseCommitDecisionTable || d.Table == ha.OutboxTable || d.Table == ha.DefaultLWWTableName {
 			return
 		}
 		if change, ok := getChange(&d); ok {
@@ -66,6 +66,23 @@ func (a *hooksAdapter) DisableHooks(conn ha.SQLiteConn) {
 	sconn.Raw().PreUpdateHook(nil)
 	sconn.Raw().CommitHook(nil)
 	sconn.Raw().RollbackHook(nil)
+}
+
+func extractValue(v sqlite3.Value) any {
+	switch v.Type() {
+	case sqlite3.INTEGER:
+		return v.Int64()
+	case sqlite3.FLOAT:
+		return v.Float()
+	case sqlite3.TEXT:
+		return v.Text()
+	case sqlite3.BLOB:
+		return v.Blob([]byte{})
+	case sqlite3.NULL:
+		return nil
+	default:
+		return v.Text()
+	}
 }
 
 func getChange(d *sqlite3.PreUpdateData) (c ha.Change, ok bool) {
@@ -88,13 +105,13 @@ func getChange(d *sqlite3.PreUpdateData) (c ha.Change, ok bool) {
 				slog.Error("failed to get preUpdateChange old value", "table", d.Table, "index", i, "error", err)
 				continue
 			}
-			c.OldValues[i] = oldValue
+			c.OldValues[i] = extractValue(oldValue)
 			newValue, err := d.New(i)
 			if err != nil {
 				slog.Error("failed to get preUpdateChange new value", "table", d.Table, "index", i, "error", err)
 				continue
 			}
-			c.NewValues[i] = newValue
+			c.NewValues[i] = extractValue(newValue)
 		}
 	case sqlite3.AUTH_INSERT:
 		c.Operation = "INSERT"
@@ -105,7 +122,7 @@ func getChange(d *sqlite3.PreUpdateData) (c ha.Change, ok bool) {
 				slog.Error("failed to get preUpdateChange new value", "table", d.Table, "index", i, "error", err)
 				continue
 			}
-			c.NewValues[i] = v.Text()
+			c.NewValues[i] = extractValue(v)
 		}
 	case sqlite3.AUTH_DELETE:
 		c.Operation = "DELETE"
@@ -116,7 +133,7 @@ func getChange(d *sqlite3.PreUpdateData) (c ha.Change, ok bool) {
 				slog.Error("failed to get preUpdateChange old value", "table", d.Table, "index", i, "error", err)
 				continue
 			}
-			c.OldValues[i] = v.Text()
+			c.OldValues[i] = extractValue(v)
 		}
 	default:
 		c.Operation = fmt.Sprintf("UNKNOWN - %d", d.Op)
